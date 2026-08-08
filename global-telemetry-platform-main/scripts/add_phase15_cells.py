@@ -1,0 +1,325 @@
+"""Append Phase 1.5 sections (§17–§18, §19, §16b) to GradedAssignment.ipynb."""
+import json
+from pathlib import Path
+
+NB_PATH = Path(__file__).resolve().parent.parent / "notebooks" / "GradedAssignment.ipynb"
+
+
+def md(cell_id, lines):
+    return {"cell_type": "markdown", "id": cell_id, "metadata": {}, "source": lines}
+
+
+def code(cell_id, lines):
+    return {
+        "cell_type": "code",
+        "execution_count": None,
+        "id": cell_id,
+        "metadata": {},
+        "outputs": [],
+        "source": lines,
+    }
+
+
+new_cells = []
+
+# ─── §17–§18 markdown ───────────────────────────────────────────────────────
+new_cells.append(md("cell-md-s17", [
+    "## §17 — Lazy Evaluation\n",
+    "\n",
+    "> 📌 Assignment Mapping — Part 4, Q1: Lazy Evaluation and DAG Construction\n",
+    "\n",
+    "Every PySpark transformation you have applied in this notebook — `select`, `filter`,",
+    " `withColumn`, `groupBy`, `agg`, `orderBy` — shares one property that is easy to",
+    " miss until you watch a job in the Spark UI: **nothing runs when you write the",
+    " transformation**. Spark records what you *want* to compute and waits.\n",
+    "\n",
+    "That deferral is **lazy evaluation**. Transformations such as `map`, `filter`, and",
+    " `groupBy` append nodes to a logical plan; they do not touch cluster CPU, memory, or",
+    " disk. Only an **action** — `count`, `collect`, `show`, `write` — tells the driver",
+    " to compile the accumulated plan and launch tasks.\n",
+    "\n",
+    "The performance benefit is not subtle. Because Spark sees the *entire* plan before",
+    " executing anything, the Catalyst optimiser can fuse adjacent narrow transforms,",
+    " push filters closer to the source, and eliminate dead columns — optimisations that",
+    " are impossible if each line of notebook code ran eagerly the moment it was written.",
+    " In §9–11 you chained `select → filter → withColumn` before the first `groupBy`;",
+    " Spark pipelined all three narrow steps into a single scan of the CSV rather than",
+    " materialising three intermediate DataFrames.\n",
+    "\n",
+    "You can feel the laziness directly: rebuild the §9–11 pipeline below and notice that",
+    " calling `.groupBy(...).agg(...).orderBy(...)` produces no log output and no progress",
+    " bar. The plan exists; execution waits for an action.\n",
+]))
+
+new_cells.append(code("cell-code-s17-lazy", [
+    "from pyspark.sql import functions as F\n",
+    "\n",
+    "# ── Rebuild the §9–11 pipeline (transformations only — no action yet) ─────────\n",
+    "sdf_lazy = (\n",
+    "    spark.read\n",
+    "    .option(\"header\", \"true\")\n",
+    "    .option(\"inferSchema\", \"true\")\n",
+    "    .csv(f\"{DATA_DIR}/telemetry_raw.csv\")\n",
+    ")\n",
+    "\n",
+    "df_lazy_selected = sdf_lazy.select(\"vehicle_model\", \"engine_temperature\")\n",
+    "df_lazy_filtered = df_lazy_selected.filter(\n",
+    "    (F.col(\"engine_temperature\") >= 60.0) &\n",
+    "    (F.col(\"engine_temperature\") <= 120.0)\n",
+    ")\n",
+    "df_lazy_with_f = df_lazy_filtered.withColumn(\n",
+    "    \"engine_temp_f\",\n",
+    "    F.round(F.col(\"engine_temperature\") * 9 / 5 + 32, 2)\n",
+    ")\n",
+    "df_lazy_avg = (\n",
+    "    df_lazy_with_f\n",
+    "    .groupBy(\"vehicle_model\")\n",
+    "    .agg(\n",
+    "        F.round(F.avg(\"engine_temperature\"), 2).alias(\"avg_engine_temp_c\"),\n",
+    "        F.count(\"*\").alias(\"record_count\"),\n",
+    "    )\n",
+    ")\n",
+    "df_lazy_result = df_lazy_avg.orderBy(F.col(\"avg_engine_temp_c\").desc())\n",
+    "\n",
+    "print(\"Transformations registered — no Spark job has run yet.\")\n",
+    "print(f\"Logical plan nodes exist; isStreaming = {df_lazy_result.isStreaming}\")\n",
+    "\n",
+    "# Action #1: materialise the plan — this is when Spark actually executes.\n",
+    "row_count = df_lazy_result.count()\n",
+    "print(f\"\\nAction triggered (count) — {row_count} vehicle models returned.\")\n",
+]))
+
+new_cells.append(md("cell-md-s18", [
+    "## §18 — DAG Construction and Physical Execution Stages\n",
+    "\n",
+    "Lazy evaluation does not mean Spark executes one transformation at a time in",
+    " notebook order. When an action fires, the driver walks the logical plan and builds a",
+    " **DAG** (Directed Acyclic Graph) of operations — the same graph you saw as RDD",
+    " lineage in §14–15, now at the DataFrame/Catalyst level.\n",
+    "\n",
+    "Use the §9–11 pipeline as the concrete example. Starting from `read CSV`, the DAG",
+    " grows through three narrow transforms (`select`, `filter`, `withColumn`) that Spark",
+    " can fuse into one map stage. Then `groupBy(\"vehicle_model\").agg(...)` introduces",
+    " the first **Wide Dependencies** shuffle: every partition that holds rows for",
+    " \"Tesla Model 3\" must send those rows to the same reducer partition. Finally",
+    " `orderBy(avg_engine_temp_c DESC)` introduces a second wide dependency — a global",
+    " sort — and forces another shuffle.\n",
+    "\n",
+    "**Wide Dependencies** are the reason Spark cuts the logical DAG into separate",
+    " **physical execution Stages**. A narrow dependency can pipeline inside one task:",
+    " partition *i* of the input feeds partition *i* of the output with no network",
+    " traffic. A wide dependency cannot — reducer partition *j* may need rows from *every*",
+    " mapper partition — so Spark must fully materialise the shuffle output (spill to",
+    " disk, transfer over the network, read back on the receiving node) before the next",
+    " stage's tasks can start. Each shuffle boundary is a hard cut: Stage 1 ends, shuffle",
+    " completes, Stage 2 begins.\n",
+    "\n",
+    "The §13 salting pipeline adds two more wide-dependency stage boundaries (salted",
+    " `groupBy`, then de-salt `groupBy`) on top of the same principle — the DAG grows",
+    " wider, but the stage-splitting rule does not change.\n",
+    "\n",
+    "The code below prints the optimised physical plan for the §9–11 job and counts how",
+    " many `Exchange` (shuffle) operators appear — each one marks a wide dependency and",
+    " therefore a boundary between **physical execution Stages**.\n",
+]))
+
+new_cells.append(code("cell-code-s18-dag", [
+    "# ── Physical plan + stage-boundary evidence on the real §9–11 pipeline ────────\n",
+    "spark.sparkContext.setJobGroup(\n",
+    "    \"§17-18 DAG demo\",\n",
+    "    \"Show physical execution Stages for §9–11 avg-temperature job\",\n",
+    ")\n",
+    "\n",
+    "print(\"=== Optimised Physical Plan (§9–11 pipeline) ===\")\n",
+    "plan_text = df_lazy_result._jdf.queryExecution().executedPlan().toString()\n",
+    "df_lazy_result.explain(mode=\"formatted\")\n",
+    "\n",
+    "# Each Exchange operator in the plan corresponds to one shuffle / stage boundary.\n",
+    "exchange_count = plan_text.count(\"Exchange\")\n",
+    "stage_count  = exchange_count + 1   # N shuffles → N+1 physical execution Stages\n",
+    "print(f\"\\nExchange (shuffle) operators in plan : {exchange_count}\")\n",
+    "print(f\"Physical execution Stages (approx.)   : {stage_count}\")\n",
+    "print(\"(Each Exchange marks a Wide Dependencies boundary — data must be\")\n",
+    "print(\" redistributed before the next physical execution Stage can start.)\")\n",
+]))
+
+# ─── §19 markdown ───────────────────────────────────────────────────────────
+new_cells.append(md("cell-md-s19", [
+    "## §19 — Data Locality and the I/O Bandwidth Tax\n",
+    "\n",
+    "> 📌 Assignment Mapping — Part 4, Q2: Data Locality and the I/O Bandwidth Tax\n",
+    "\n",
+    "Distributed systems have a hard speed limit that no amount of CPU can erase:",
+    " moving bytes over a network is orders of magnitude slower than reading them from",
+    " local disk, and slower still than reading them from RAM on the same socket.\n",
+    " Spark's scheduling philosophy is therefore simple and ruthless: **Don't move data,",
+    " move code**. Ship the task (the compiled bytecode for your `filter`, your `agg`,",
+    " your UDF) to the node that already holds the input partition, rather than pulling",
+    " the partition across the cluster to a central compute node.\n",
+    "\n",
+    "### Data Locality\n",
+    "\n",
+    "**Data Locality** is Spark's mechanism for honouring that philosophy. When the DAG",
+    " scheduler assigns a task, it ranks candidate executor nodes by how close they are",
+    " to the input split:\n",
+    "\n",
+    "1. **PROCESS_LOCAL** — data is in memory on the same executor (best case).\n",
+    "2. **NODE_LOCAL** — data is on the same physical node, different JVM.\n",
+    "3. **RACK_LOCAL** — data is on the same rack, different node.\n",
+    "4. **ANY** — data must be fetched over the network from a remote rack.\n",
+    "\n",
+    "For the telemetry CSV in §8, the first stage's `FileScan` tasks run where the file",
+    " blocks live. Each task reads its local split, applies the fused narrow transforms",
+    " (`select`, `filter`, `withColumn`), and emits shuffle data — all without a",
+    " cross-cluster read of the raw CSV. Scheduling tasks on the node that already holds",
+    " the data partition keeps network links free for the unavoidable wide-dependency",
+    " shuffles in §9–11 and §13, where data *must* move because keys need to be",
+    " co-located.\n",
+    "\n",
+    "### Spark Lineage Recovery vs Hadoop Replication — the I/O Bandwidth Tax\n",
+    "\n",
+    "Fault tolerance in Hadoop and Spark solves the same problem — survive node loss —",
+    " but they pay for it at opposite ends of the pipeline.\n",
+    "\n",
+    "Hadoop HDFS pays the **I/O bandwidth tax** **up front and repeatedly**: every block",
+    " is written to three physical replicas on three separate nodes at ingest time.",
+    " Every MapReduce stage reads those replicas from disk and writes new replicas for",
+    " its output. You pay the network cost whether or not a node ever fails — three",
+    " copies of 43 TB of telemetry is 129 TB of replication traffic before anyone runs",
+    " a single query.\n",
+    "\n",
+    "Spark inverts that trade. It keeps one logical copy of each partition and records",
+    " the **lineage** — the DAG from §18 — as the recovery plan. If a task fails, Spark",
+    " recomputes only the lost partition by replaying the lineage on a surviving node.",
+    " No standing replication tax. The cost arrives only on failure, and it scales with",
+    " lineage depth (which is why §16 introduces checkpointing to cap that depth).\n",
+    "\n",
+    "The contrast in bandwidth terms:\n",
+    "\n",
+    "| Strategy | When network I/O is spent | Cost on happy path |\n",
+    "|----------|--------------------------|--------------------|\n",
+    "| HDFS replication | At every write; every MapReduce shuffle | High — constant **I/O bandwidth tax** |\n",
+    "| Spark lineage | Only when a partition is lost and must be recomputed | Low — pay only on failure |\n",
+    "\n",
+    "Spark still pays the **I/O bandwidth tax** during wide-dependency shuffles — that",
+    " is unavoidable when keys must be co-located — but it avoids the standing",
+    " multi-copy replication overhead that Hadoop carries on every byte, every day.\n",
+]))
+
+# ─── §16b markdown ──────────────────────────────────────────────────────────
+new_cells.append(md("cell-md-s16b", [
+    "## §16b — Liability of Lineage\n",
+    "\n",
+    "> 📌 Assignment Mapping — Part 4, Q3: Liability of Lineage\n",
+    "\n",
+    "§14–15 established that Spark's lineage graph is the engine of **fault tolerance**",
+    " **without heavy data replication**. §16 showed checkpointing as the fix for deep",
+    " lineage in iterative jobs. This section names the problem checkpointing solves:",
+    " the **Liability of Lineage**.\n",
+    "\n",
+    "### The Liability in an Iterative Loop\n",
+    "\n",
+    "Return to the simulated feature-engineering loop in §16: 40 iterations, each adding",
+    " two `withColumn` transforms on top of the previous DataFrame. Every iteration",
+    " appends two new nodes to the lineage graph. After 40 iterations the DAG is ~80",
+    " transforms deep; after 200 it would be ~400 deep. The lineage that makes Spark",
+    " cheap to store becomes expensive to *use* in two specific ways:\n",
+    "\n",
+    "1. **Recovery time grows without bound.** If an executor dies on iteration 195 of",
+    "   200, Spark must replay all 195 prior transformation steps to reconstruct the",
+    "   lost partition — even though the intermediate results were deterministic and",
+    "   could have been snapshotted long ago. The longer the chain, the slower every",
+    "   failure recovery becomes.\n",
+    "2. **The lineage graph itself can crash the driver.** Spark's DAG scheduler walks",
+    "   the lineage recursively when planning and optimising jobs. An sufficiently deep",
+    "   chain overflows the JVM call stack, producing **StackOverflow errors** — the",
+    "   exact failure mode §16 demonstrated at iteration 40 with checkpointing every",
+    "   10 steps.\n",
+    "\n",
+    "That compounding cost — storage is cheap, but replay and scheduler recursion are",
+    " not — is the **Liability of Lineage**: the longer the chain, the more you owe.",
+    "\n",
+    "### How Checkpointing Breaks the Family Tree\n",
+    "\n",
+    "`df.checkpoint()` writes the current DataFrame to reliable storage (`CHECKPOINT_DIR`,",
+    " set in the bootstrap cell) and **severs the lineage**. The checkpointed DataFrame's",
+    " parent is the checkpoint file on disk, not the chain of 80 `withColumn` nodes that",
+    " produced it. Spark forgets everything before the checkpoint.\n",
+    "\n",
+    "Called every 10 iterations in §16, checkpointing bounds lineage depth at ~20 nodes",
+    " regardless of total iteration count. Recovery after a failure replays at most 10",
+    " iterations back to the last checkpoint — not back to the CSV read. This **stabilizes",
+    " recovery time** and prevents the scheduler from walking an unbounded graph.\n",
+    "\n",
+    "### Checkpointing vs Caching — What Each Actually Does\n",
+    "\n",
+    "§16 used `.cache()` on the source DataFrame *and* `.checkpoint()` inside the loop.",
+    " They look similar — both keep data around for reuse — but they solve different",
+    " problems:\n",
+    "\n",
+    "| | `.cache()` / `.persist()` | `.checkpoint()` |\n",
+    "|---|---|---|\n",
+    "| **Purpose** | Speed up *repeated reads* of the same DataFrame within a session | Truncate lineage for *fault tolerance* in long chains |\n",
+    "| **Storage** | Memory (spill to disk if memory pressure) | Reliable filesystem (`CHECKPOINT_DIR`) |\n",
+    "| **Lineage** | **Not truncated** — the full DAG remains intact | **Truncated** — parent becomes the checkpoint file |\n",
+    "| **On failure** | If the cached copy is lost (executor evicted, node died), Spark must **replay the full lineage** from the original source to rebuild it | Spark reads the checkpoint file directly — **no lineage replay** required |\n",
+    "| **Cost** | Cheap for short pipelines; memory pressure on large DataFrames | Disk I/O on every checkpoint call; pays off when lineage depth would otherwise grow unbounded |\n",
+    "\n",
+    "**Cache** answers: \"I am going to read this result again soon — keep it hot.\"\n",
+    " **Checkpoint** answers: \"This chain is getting too long — cut the history here so",
+    " recovery does not depend on replaying everything that came before.\"\n",
+    "\n",
+    "In the §16 loop, caching the CSV baseline avoids re-reading the file on every",
+    " iteration (performance). Checkpointing every 10 iterations caps the **Liability of",
+    " Lineage** (resilience). You need both, for different reasons — conflating them is",
+    " one of the most common Spark mistakes in production iterative pipelines.\n",
+]))
+
+
+def update_toc(cells):
+    for cell in cells:
+        if cell.get("id") == "cell-md-toc":
+            cell["source"] = [
+                "## Table of Contents\n",
+                "\n",
+                "| Section | Title |\n",
+                "|---------|-------|\n",
+                "| §4  | Big Data Constraints — Scale-Out Justification via the Three Vs |\n",
+                "| §5  | Consistency Models — ACID vs BASE via CAP Theorem |\n",
+                "| §6  | MapReduce — Total Miles Driven per Vehicle Model |\n",
+                "| §7  | Hadoop vs Spark — In-Memory Computing vs Disk-Bound I/O |\n",
+                "| §8  | Synthetic Dataset Generation |\n",
+                "| §9  | Transformations & Aggregation — Narrow vs Wide Dependencies (Part 1) |\n",
+                "| §10 | Transformations & Aggregation — Narrow vs Wide Dependencies (Part 2) |\n",
+                "| §11 | Transformations & Aggregation — Narrow vs Wide Dependencies (Part 3) |\n",
+                "| §12 | *(coming soon)* |\n",
+                "| §13 | Data Skew — Salting Strategy for Data Skew |\n",
+                "| §14 | RDD Lineage & Fault Tolerance (Part 1) |\n",
+                "| §15 | RDD Lineage & Fault Tolerance (Part 2) |\n",
+                "| §16 | Liability of Lineage & Checkpointing |\n",
+                "| §17 | Lazy Evaluation — Transformations vs Actions |\n",
+                "| §18 | DAG Construction — Wide Dependencies and Physical Execution Stages |\n",
+                "| §19 | Data Locality and the I/O Bandwidth Tax |\n",
+                "| §16b | Liability of Lineage — Checkpointing vs Caching (Part 4, Q3) |\n",
+                "| §20 | *(coming soon)* |\n",
+                "| §21 | *(coming soon)* |\n",
+            ]
+            return
+    raise RuntimeError("TOC cell (cell-md-toc) not found")
+
+
+def main():
+    with NB_PATH.open() as f:
+        nb = json.load(f)
+
+    update_toc(nb["cells"])
+    nb["cells"].extend(new_cells)
+
+    with NB_PATH.open("w") as f:
+        json.dump(nb, f, indent=1, ensure_ascii=False)
+
+    print(f"Done. Notebook now has {len(nb['cells'])} cells (+{len(new_cells)} new).")
+
+
+if __name__ == "__main__":
+    main()
